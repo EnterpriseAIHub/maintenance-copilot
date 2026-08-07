@@ -1,0 +1,22 @@
+# Defines this repo's own service only. Deliberately does NOT define a
+# `postgres` service, and deliberately does NOT depend_on one — this file
+# must stay valid standalone even if merged into a future platform-level
+# compose whose shared Postgres service isn't named `postgres`. The
+# standalone `postgres` service, and the `api` service's dependency on it,
+# both live in docker-compose.override.yml (see that file's comment).
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      COPILOT_DATABASE_URL: postgresql+psycopg://copilot:copilot@postgres:5432/copilot
+    # Bind-mounts uploaded source files (Phase 2) so they survive a
+    # container restart. The chunk/embedding data derived from them lives
+    # in Postgres regardless, so this only matters for re-index and for
+    # inspecting what was uploaded — not for search/retrieval correctness.
+    volumes:
+      - ./data/raw:/app/data/raw
+    command: sh -c "alembic upgrade head && uvicorn app.api.main:app --host 0.0.0.0 --port 8000"

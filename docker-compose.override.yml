@@ -1,0 +1,37 @@
+# Automatically merged by `docker compose up` when present. Provides a
+# local Postgres+pgvector instance so this repo satisfies NFR1 (fully
+# standalone runnability) with zero other Enterprise AI Platform repos
+# present. If/when this repo is composed into a platform-level
+# docker-compose that provides a shared Postgres instance, omit this file
+# (or override `services.postgres` to point elsewhere) rather than editing
+# docker-compose.yml.
+#
+# `api`'s dependency on `postgres` (wait for healthy before starting) is
+# also defined here rather than in the base file — Compose merges
+# `depends_on` maps across files, so this adds the dependency onto the
+# `api` service defined in docker-compose.yml without the base file ever
+# needing to know a service named `postgres` exists.
+services:
+  api:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: copilot
+      POSTGRES_PASSWORD: copilot
+      POSTGRES_DB: copilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - copilot_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U copilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  copilot_postgres_data:

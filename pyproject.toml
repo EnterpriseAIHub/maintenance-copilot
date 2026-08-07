@@ -1,0 +1,33 @@
+[project]
+name = "maintenance-copilot"
+version = "0.1.0"
+description = "RAG-based maintenance knowledge copilot — Project A of the Enterprise AI Platform."
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require a running Postgres instance",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: FastAPI's `Depends(...)` as a default argument is the framework's
+# idiomatic dependency-injection pattern, not the mutable-default-argument
+# bug this rule is designed to catch. Every route in this repo uses it.
+ignore = ["B008"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+disallow_untyped_defs = true
+exclude = ["alembic/versions"]
