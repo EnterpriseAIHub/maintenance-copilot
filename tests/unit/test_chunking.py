@@ -81,3 +81,40 @@ def test_estimate_token_count_is_never_zero_for_nonempty_text() -> None:
 
 def test_empty_pages_produce_no_chunks() -> None:
     assert chunk_pages([]) == []
+
+
+def test_merged_chunk_keeps_first_sections_heading_not_a_later_one() -> None:
+    # Two short sections that together still fit under target_tokens get
+    # packed into a single chunk. Regression test for a labeling bug where
+    # flush() used whatever heading was *most recently seen* (SAFETY
+    # PRECAUTIONS) rather than the heading in effect when this chunk's
+    # content actually started accumulating (OVERVIEW).
+    text = (
+        "OVERVIEW\n\n"
+        "Short intro paragraph about the equipment.\n\n"
+        "SAFETY PRECAUTIONS\n\n"
+        "Short paragraph about lockout tagout."
+    )
+    pages = [ExtractedPage(page_number=1, text=text)]
+
+    chunks = chunk_pages(pages, target_tokens=500)
+
+    assert len(chunks) == 1
+    assert chunks[0].section_title == "OVERVIEW"
+
+
+def test_section_boundary_forces_correct_label_on_each_side() -> None:
+    # When the combined content of two sections *doesn't* fit in one
+    # chunk, each resulting chunk should be labeled with the heading that
+    # was active when its own content started, not a heading from later
+    # in the document.
+    para_a = "Sentence about section A. " * 20
+    para_b = "Sentence about section B. " * 20
+    text = f"SECTION A HEADING\n\n{para_a}\n\nSECTION B HEADING\n\n{para_b}"
+    pages = [ExtractedPage(page_number=1, text=text)]
+
+    chunks = chunk_pages(pages, target_tokens=100, overlap_tokens=10)
+
+    assert len(chunks) >= 2
+    assert chunks[0].section_title == "SECTION A HEADING"
+    assert chunks[-1].section_title == "SECTION B HEADING"

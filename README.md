@@ -13,8 +13,11 @@ planning artifacts).
 
 ## Status
 
-**Phase 2 of 6 — Document Ingestion.** Documents can be uploaded, extracted, cleaned,
-chunked, embedded, and stored. No retrieval or conversation logic yet — that's Phase 3+.
+**Phase 4 of 6 — Conversations & Persistence.** Documents can be uploaded, extracted,
+cleaned, chunked, embedded, and stored. Questions can be answered with grounded, cited,
+confidence-scored responses via a stateless `POST /query` debug endpoint, or as a
+persisted, streamed conversation via `POST /conversations/{id}/messages`, with prior
+turns feeding conversation memory. No feedback/escalation logic yet — that's Phase 5+.
 See `PROJECT_PROGRESS.md` for full phase-by-phase status, what's deliberately deferred,
 and architectural decisions made along the way.
 

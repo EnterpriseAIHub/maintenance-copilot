@@ -31,9 +31,12 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://copilot:copilot@localhost:5432/copilot"
 
     # --- RAG providers ---
-    # llm_provider is unused until Phase 3; kept here so the config shape is
-    # stable across phases.
+    # llm_provider: "anthropic" (default, real answers via the Messages
+    # API) or "fake" (deterministic, no network/API key required — same
+    # precedent as embedding_provider below).
     llm_provider: str = "anthropic"
+    anthropic_api_key: str | None = None
+    llm_model: str = "claude-sonnet-5"
     # embedding_provider: "openai" (default, real embeddings) or "fake"
     # (deterministic, no network/API key required — used by tests, and
     # available for local development without an OpenAI key so this repo
@@ -41,6 +44,16 @@ class Settings(BaseSettings):
     embedding_provider: str = "openai"
     openai_api_key: str | None = None
     confidence_threshold: float = 0.55
+    # Number of chunks the retriever returns per query (Phase 3). Added
+    # now, alongside the retriever that's the first thing to read it — not
+    # added speculatively ahead of need.
+    retrieval_top_k: int = 5
+    # Number of most-recent message pairs (Phase 4) loaded from a
+    # conversation's history and passed to the LLM as prompt context for
+    # follow-up questions — see app/services/conversation_service.py.
+    # Bounded rather than unbounded so prompt size/cost don't grow
+    # unboundedly as a conversation gets long.
+    conversation_history_limit: int = 6
 
     # --- Document ingestion (Phase 2) ---
     # Where uploaded source files are stored on disk. Relative to the

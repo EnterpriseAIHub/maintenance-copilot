@@ -13,8 +13,8 @@ is the source of truth for *status*.
 |---|---|
 | 1 — Foundation & Standalone Setup | ✅ Complete |
 | 2 — Document Ingestion | ✅ Complete |
-| 3 — RAG Core & Retrieval (stateless) | ⬜ Not started |
-| 4 — Conversations & Persistence | ⬜ Not started |
+| 3 — RAG Core & Retrieval (stateless) | ✅ Complete |
+| 4 — Conversations & Persistence | ✅ Complete |
 | 5 — Feedback & Escalation | ⬜ Not started |
 | 6 — Cross-Repo Integration, Agent Contract & Hardening | ⬜ Not started |
 
@@ -50,6 +50,11 @@ is the source of truth for *status*.
 pass. Docker and a live Postgres instance were **not** available in the sandbox this was
 built in, so `docker compose up` and the `/ready` + migration path were not exercised
 end-to-end here — verify locally before treating Phase 1 as fully closed.
+
+**Update (Phase 3):** a local Postgres+pgvector instance was installed directly in the
+build sandbox (see Phase 3's "Verified in this environment") and `tests/integration/
+test_ready.py` was actually run for the first time — it passes. Phase 1 is now fully
+verified, not just unit-tested.
 
 ### Postponed (not part of Phase 1's scope)
 
@@ -140,6 +145,13 @@ The integration tests were **not** run — no live Postgres available in this sa
 limitation noted in Phase 1. Verify locally with `docker compose up -d postgres && alembic
 upgrade head && pytest -v -m integration` before treating Phase 2 as fully closed.
 
+**Update (Phase 3):** now verified — see Phase 3's "Verified in this environment". Running
+`test_documents_api.py` against a real Postgres for the first time surfaced one real bug,
+fixed as part of Phase 3 (see that section's bug note): unsupported file types were only
+ever caught inside the async ingestion background job, so `POST /documents` always
+returned `201` even for a file type ingestion could never process, instead of failing
+synchronously with `400 UNSUPPORTED_FILE_TYPE`.
+
 **Bug caught by actually running the tests, not just linting:** the `DELETE /documents/{id}`
 route's `-> None` return annotation made FastAPI infer a response body was required, which
 is invalid for a 204 status — this crashed route registration at import time, which would
@@ -198,6 +210,331 @@ tests" — all three were run before calling this phase done.
 
 ---
 
+## Phase 3 — RAG Core & Retrieval (stateless) ✅
+
+### Implemented
+
+- **Retriever** (`app/rag/retriever.py`): pgvector cosine-similarity search
+  (`Chunk.embedding.cosine_distance(...)`, matching the `ivfflat` index's
+  `vector_cosine_ops` from migration `0002`) joined to `Document`, filtered to
+  `status = 'active'` and optionally `equipment_id`/`plant_id` — filtered against
+  `Document`'s own columns (indexed via `ix_document_equipment_status`), not the
+  duplicate copy in `Chunk.chunk_metadata`. Returns `RetrievedChunk` (chunk + similarity).
+- **LLM client** (`app/rag/llm_client.py`): `LLMClient` interface, `AnthropicLLMClient`
+  (default real provider, Claude via the Messages API) and `FakeLLMClient` (deterministic,
+  no network — same precedent as `FakeEmbeddingClient`). Citations are structured, not
+  free-text: the model is forced (`tool_choice`) to call a single `provide_answer` tool
+  whose schema requires `answer`, `cited_chunk_ids`, and a self-rated `confidence`.
+- **Prompt builder** (`app/rag/prompt_builder.py`): system prompt instructing
+  context-only, cited answers; user prompt assembling each retrieved chunk as a labeled
+  block (`chunk_id`, `section`, `page`) followed by the question.
+- **Citation extractor** (`app/rag/citation_extractor.py`): resolves the LLM's
+  `cited_chunk_ids` back into `Citation` records (document, section, page, a short
+  snippet) against the chunks that were actually retrieved — any cited id not in that set
+  (a hallucinated citation) is dropped, not trusted.
+- **Confidence scorer** (`app/rag/confidence_scorer.py`): `0.5 * mean similarity of cited
+  chunks + 0.5 * LLM self-rated confidence`, clamped to `[0, 1]`. Zero citations → `0.0`
+  outright, regardless of self-rating. Compared against `COPILOT_CONFIDENCE_THRESHOLD`
+  by future callers (Phase 5's auto-escalation).
+- **Orchestrator** (`app/rag/orchestrator.py`): `answer_question()` — the single function
+  chaining retrieval → prompt → LLM call → citation extraction → confidence scoring.
+  Accepts optional `embedding_client`/`llm_client` overrides (used by tests and the eval
+  harness); defaults to whatever `app/config/settings.py` configures. Returns a `RagAnswer`
+  (answer, citations, confidence, retrieved_chunk_count), or a fixed "no ingested
+  documents address this" answer with `confidence=0.0` when retrieval returns nothing.
+  Intended to be the same function `/conversations/{id}/messages` (Phase 4) and `/agent`
+  (Phase 6) call later, unchanged — same "one code path" principle already used for
+  `run_ingestion_job()` in Phase 2.
+- **Schemas & route:** `app/schemas/query.py` (`QueryRequest`, `QueryResponse`,
+  `CitationRead`), `app/api/routes/query.py` — `POST /query`, a stateless debug/eval
+  endpoint (no conversation persistence — that's Phase 4). Empty/whitespace-only
+  `question` raises `ValidationError` synchronously (same `AppError` envelope as every
+  other domain error in this repo), rather than relying on Pydantic's own 422 shape.
+- **Config:** `Settings` gained `llm_provider` (already present, now actually read),
+  `anthropic_api_key`, `llm_model` (default `claude-sonnet-5`), and `retrieval_top_k`
+  (default `5`) — added alongside the first code that reads each, per the existing rule.
+  `.env.example` and CI now default `COPILOT_LLM_PROVIDER=fake` in addition to
+  `COPILOT_EMBEDDING_PROVIDER=fake`, so `docker compose up` still requires zero external
+  API keys (NFR1) now that a second real provider exists.
+- **Dependency:** `anthropic` SDK added to `requirements.txt` (also deduplicated a stray
+  repeated block in that file left over from an earlier edit — `python-multipart`/`pypdf`/
+  `python-docx`/`openai` were each listed twice; harmless but untidy).
+- **Golden-dataset evaluation harness** (Phase 3's exit criterion):
+  `scripts/generate_seed_docs.py` generates two synthetic, born-digital seed documents
+  (`data/seed/centrifugal_pump_p101_sop.docx`, `data/seed/conveyor_cb200_manual.docx` — a
+  pump maintenance SOP and a conveyor manual, five sections each, ALL-CAPS headings sized
+  so each section lands in its own chunk under the default ~500-token target — see that
+  script's docstring for why ALL CAPS specifically). `tests/rag_eval/golden_dataset.py`
+  pairs six questions (three per document) with the section a correct, grounded answer
+  should cite. `tests/rag_eval/test_golden_eval.py` ingests both seed documents once per
+  module run and asserts citation recall ≥ 0.8 across the six questions — but only against
+  the **real** embedding/LLM providers (`COPILOT_EMBEDDING_PROVIDER=openai` +
+  `COPILOT_LLM_PROVIDER=anthropic` with both API keys set); it self-skips otherwise via
+  `pytest.mark.skipif`, since the fake providers aren't semantically meaningful and running
+  a recall eval against them wouldn't test anything real. New `rag_eval` pytest marker.
+- **Tests:** unit — `test_llm_client.py`, `test_prompt_builder.py`,
+  `test_citation_extractor.py`, `test_confidence_scorer.py` (23 cases total). Integration
+  — `test_retriever.py` (6 cases: exact-match ordering, equipment/plant filtering, active-
+  only filtering, top_k, no-match), `test_orchestrator.py` (3 cases, using
+  `FakeEmbeddingClient`+`FakeLLMClient` against a real DB), `test_query_api.py` (4 cases,
+  full HTTP round-trip through real `/documents` upload then `/query`).
+
+### Verified in this environment
+
+Unlike Phases 1–2, this phase's verification wasn't deferred: Docker itself still isn't
+available in this build sandbox, but a local **Postgres 16 + pgvector** instance was
+installed directly (`apt-get install postgresql postgresql-16-pgvector`, both packages
+resolve via the sandbox's allowed apt mirrors) and migrations were run against it with
+`alembic upgrade head`. With that in place, **every** test in the repo — Phase 1–2's
+previously-unexecuted integration tests included — was actually run and passes:
+`ruff check .`, `black --check .`, `mypy app` all clean; `pytest -v` (full suite, run once,
+justified because this phase touched shared infrastructure — `chunking.py` and
+`document_service.py`, both Phase 2 files, see bug note below) → **70 passed, 1 skipped**
+(the golden-dataset eval, correctly self-skipping — no real provider keys in this
+sandbox). The golden-dataset harness itself could not be run end-to-end here since no real
+`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` were available in this sandbox; it needs local
+verification with real keys before the Phase 3 exit criterion is fully closed.
+
+**Two real bugs found and fixed as a direct result of finally running these tests:**
+
+1. **Chunking mislabeled `section_title` when short sections got merged into one chunk**
+   (`app/ingestion/chunking.py`). `flush()` labeled a chunk using `current_section` — the
+   *most recently seen* heading at flush time — rather than the heading in effect when
+   that chunk's content actually started accumulating. Two short adjacent sections that
+   together still fit under `target_tokens` would end up in one chunk mislabeled with the
+   *second* section's heading, even though most (or all) of the chunk's content belonged
+   to the first. Found while building the golden-dataset seed documents (the conveyor
+   document's `OVERVIEW` + `BELT TENSIONING` merged this way) — this would have silently
+   produced wrong citations. Fixed by tracking a separate `buffer_section` that's only
+   updated when the buffer is empty (i.e., at the start of new content), and using that at
+   flush time instead of the live `current_section`. Regression tests added:
+   `test_merged_chunk_keeps_first_sections_heading_not_a_later_one`,
+   `test_section_boundary_forces_correct_label_on_each_side`.
+2. **`POST /documents` never synchronously rejected unsupported file types**
+   (`app/services/document_service.py`). The extension check only ever ran inside
+   `run_ingestion_job()` — the async background task — so upload always returned `201`
+   even for a file type ingestion could never process; the `400 UNSUPPORTED_FILE_TYPE`
+   response only ever existed in `tests/integration/test_documents_api.py`'s *expectation*,
+   never in the actual code path, because that test had never been executed against a real
+   Postgres before this phase. Fixed by checking `Path(filename).suffix` against
+   `SUPPORTED_EXTENSIONS` synchronously in `DocumentService.create_document()`, before any
+   DB row or file is written — fail fast on a bad request rather than deferring the
+   failure to a background job. This is a Phase 2 bug, fixed now because verifying Phase
+   1–2's deferred integration tests before starting Phase 3's retriever work (per this
+   file's own prior "Where Phase 3 should begin" note) is what surfaced it.
+
+### Postponed (within Phase 3's own scope)
+
+- **`/ready` does not call the LLM/embedding provider.** Considered adding a provider
+  reachability check now that both clients exist, but readiness probes run frequently and
+  turning each one into a paid external API call is a cost/rate-limit risk for no real
+  benefit — provider failures already surface per-request as a normal error response from
+  `POST /query`. Documented directly in `app/api/routes/health.py`'s docstring.
+- **Hybrid/keyword search and re-ranking.** Still documented extension points for
+  `retriever.py`, not built without a concrete accuracy problem to justify them (per Phase
+  2's own note carrying this forward).
+
+### Architectural decisions made during Phase 3
+
+- **Citations are structured (tool-forced), not parsed from free text.** The LLM must call
+  a single `provide_answer` tool (`tool_choice` forced) whose schema requires
+  `cited_chunk_ids` and a self-rated `confidence` alongside the answer — chosen over
+  asking for prose and reverse-engineering which chunks it used, since that avoids ever
+  matching a citation to the wrong chunk because of similar wording. Confirmed and
+  finalized with the user before implementation (this and the two decisions below were
+  explicitly asked about, since the roadmap didn't pin them down).
+- **Confidence = 0.5 × mean similarity of *cited* chunks + 0.5 × LLM self-rated
+  confidence**, not either signal alone. Retrieval similarity alone says nothing about
+  whether the model used the evidence correctly; an LLM's self-rating alone is well known
+  to be poorly calibrated. Zero citations forces `0.0` regardless of self-rating, since an
+  ungrounded self-rating isn't evidence of anything.
+- **Golden-dataset seed content is synthetic, generated by this repo** (`scripts/
+  generate_seed_docs.py`), not supplied external documents — confirmed with the user.
+  Body paragraph lengths were deliberately tuned (via a dry run of the actual chunking
+  output, not guessed) so each section lands in its own chunk, since the eval's citation-
+  recall assertions depend on that.
+- **Retriever filters `equipment_id`/`plant_id` against `Document`'s own columns**, not
+  the duplicate copy written into `Chunk.chunk_metadata` at ingestion time. Same effective
+  filter, but reuses the existing `ix_document_equipment_status` index and avoids a JSONB
+  text-extraction comparator for no benefit.
+- **`FakeLLMClient` cites every `chunk_id` it's given** (passed explicitly as a parameter
+  to `generate_answer()`, alongside the prompt) rather than parsing ids back out of the
+  prompt text it was handed. Simpler and more robust than regex-extracting from its own
+  input, and keeps `AnthropicLLMClient` and `FakeLLMClient` behind the exact same
+  interface.
+- **Golden-dataset harness (`tests/rag_eval/`) is a new pytest marker, self-skipping
+  without real provider keys**, rather than being excluded by convention (like
+  `-m "not integration"`) or requiring a separate invocation the CI workflow has to
+  remember. `pytest -v` (no marker filter, matching CI) runs it, sees no real keys
+  configured, and skips — so it can never silently rot out of the test run entirely, but
+  also never fails CI for lacking paid API credentials.
+- **`requirements.txt` deduplicated** while adding `anthropic` — a stray repeated block
+  (`python-multipart`, `pypdf`, `python-docx`, `openai` each listed twice) was cleaned up
+  in the same edit since it was directly in the file being touched; not a separate
+  unscoped change.
+
+---
+
+## Phase 4 — Conversations & Persistence ✅
+
+### Implemented
+
+- **Schema (migration `0003`):** `conversation` (id, equipment_id/plant_id, started_by,
+  timestamps — same optional-scoping pattern as `document`), `message` (id,
+  conversation_id FK CASCADE, `role` CHECK IN `('user','assistant')`, content, confidence
+  and retrieved_chunk_count nullable/assistant-only), `citation` (id, message_id FK
+  CASCADE, `chunk_id`/`document_id` FK **SET NULL** — deliberately not CASCADE, so a
+  citation survives a later document reindex that deletes the chunk it pointed at — plus
+  denormalized `section_title`/`page_number`/`snippet` copied at write time, same
+  reasoning as Phase 2's `document.error_message`). New models registered in
+  `alembic/env.py` for autogenerate, matching Phase 2's precedent. Both `alembic upgrade
+  head` and `alembic downgrade -1` verified against a live Postgres.
+- **Repositories:** `conversation_repository.py`, `message_repository.py` (adds
+  `list_by_conversation` for full history and `list_recent_by_conversation` for bounded
+  history-loading), `citation_repository.py` (adds `create_many`, mirroring
+  `chunk_repository.py`'s bulk-insert pattern). No commits in any of them — same rule as
+  every other repository in this repo.
+- **Orchestrator/prompt builder — additive only, as agreed with the user before
+  implementation:** `app/rag/prompt_builder.py` gained `ConversationTurn` (question,
+  answer) and an optional `conversation_history` parameter on `build_prompt()`, rendered
+  as a "Conversation so far" block *before* the `Context:` block, and the system prompt
+  now explicitly tells the model history is for understanding follow-ups, not a citable
+  source. `app/rag/orchestrator.py::answer_question()` gained the same optional parameter,
+  threaded straight through to `build_prompt()`. **Retrieval embedding still comes from
+  `question` alone in every case** — history never reaches `embedding_client.embed()`.
+  Verified additive, not just by inspection: every Phase 3 test (36 cases across
+  `test_prompt_builder.py`, `test_llm_client.py`, `test_citation_extractor.py`,
+  `test_confidence_scorer.py`, `test_orchestrator.py`, `test_query_api.py`,
+  `test_retriever.py`) was re-run immediately after this change and passed unchanged, plus
+  a new regression test (`test_no_conversation_history_produces_identical_prompt_to_
+  omitting_it`) asserts the `conversation_history=None` default produces a byte-for-byte
+  identical prompt to calling `build_prompt()` without the parameter at all.
+- **`ConversationService`** (`app/services/conversation_service.py`): owns conversation
+  state the way `DocumentService` owns document state.
+  - `create_conversation()` / `get_conversation()` (raises `NotFoundError`) /
+    `list_messages()` (full history, oldest-first, each message's citations attached).
+  - `generate_answer_stream()` — a plain synchronous generator: persists the user message
+    and commits immediately (so it's saved even if the LLM call that follows fails or the
+    client disconnects mid-stream), yields a `retrieving` event, loads bounded
+    conversation history, yields a `generating` event, calls `answer_question()`
+    (wrapped in a broad `try/except` — by this point a 200 response has already started,
+    so a pipeline failure becomes a clean `error` SSE event rather than a raw traceback),
+    persists the assistant message + citation rows and commits, then yields a `done` event
+    carrying the full `MessageRead` (answer, confidence, citations).
+  - `_load_conversation_history()` pairs up the most recent user/assistant messages into
+    `ConversationTurn`s, bounded by the new `COPILOT_CONVERSATION_HISTORY_LIMIT` (default
+    6 turns) — over-fetches by one extra pair specifically to account for the
+    just-committed, not-yet-answered current question, which naturally drops out of the
+    pairing as a dangling unmatched "question" rather than needing an explicit filter.
+- **Schemas** (`app/schemas/conversation.py`): `ConversationCreateRequest`,
+  `ConversationRead`, `MessageCreateRequest`, `MessageRead`, and a `CitationRead` that is
+  **deliberately its own type**, not a reuse of Phase 3's `app/schemas/query.py::
+  CitationRead` — a persisted citation's `chunk_id`/`document_id` are nullable (the
+  `SET NULL` FK above), while Phase 3's in-flight version correctly has both non-nullable;
+  reusing the Phase 3 type here would either lie about nullability or loosen a type Phase
+  3 already got right for its own use case.
+- **Routes** (`app/api/routes/conversations.py`, prefix `/conversations`):
+  - `POST /conversations` → 201, creates a conversation.
+  - `GET /conversations/{id}` → 404 via the standard `AppError` envelope if unknown.
+  - `GET /conversations/{id}/messages` → full history with citations; 404 first if the
+    conversation doesn't exist.
+  - `POST /conversations/{id}/messages` → **SSE** (`text/event-stream`), emitting
+    `retrieving` → `generating` → `done` (or `error`) — see "Streaming decision" below.
+    Conversation-not-found and empty-question validation happen *before* the
+    `StreamingResponse` is constructed, so those two failures still go through the normal
+    JSON `AppError` envelope (status/headers aren't committed yet at that point); only a
+    failure *during* the RAG pipeline itself becomes an `error` SSE event, since a 200 has
+    already started streaming by then.
+  - Registered in `app/api/main.py` alongside `health`, `documents`, `query`.
+- **Config:** `Settings.conversation_history_limit: int = 6`, added alongside the first
+  code that reads it (`ConversationService._load_conversation_history`), per the existing
+  rule.
+- **Test fixture change:** `tests/integration/conftest.py`'s autouse cleanup fixture
+  (renamed `_clean_document_tables` → `_clean_tables`, since its scope grew) now also
+  deletes `Conversation` rows between tests — `message`/`citation` cascade automatically
+  via the real DB-level `ON DELETE CASCADE` from migration 0003, no separate queries
+  needed. This is shared test infrastructure touching every integration test file, so the
+  **full suite was re-run once** after this change (see "Verified in this environment").
+- **Tests:** `tests/integration/test_conversation_service.py` (6 cases — creation, 404,
+  full persist-both-turns-and-citations round trip, no-evidence case, conversation history
+  actually reaching the second call via a monkeypatched spy on `answer_question`, and the
+  history-limit cap verified directly against `_load_conversation_history`);
+  `tests/integration/test_conversations_api.py` (8 cases — full HTTP round trip through
+  real `/documents` upload → `/conversations` → SSE `/conversations/{id}/messages`,
+  parsing the actual `event: ...\ndata: ...\n\n` text the route writes, plus `GET
+  /conversations/{id}/messages`, and both 404/422 error paths); 4 new unit tests in
+  `test_prompt_builder.py` for the history-rendering behavior.
+
+### Verified in this environment
+
+Same local Postgres 16 + pgvector instance from Phase 3 (still no Docker in this
+sandbox). Migration `0003` was applied and **also downgraded and re-applied** to confirm
+both directions work, not just `upgrade`. `ruff check .`, `black --check .`, `mypy app`
+all clean (49 source files). Every new integration test — 6 in
+`test_conversation_service.py`, 8 in `test_conversations_api.py` — passes against the live
+DB, including real SSE bodies parsed back out of an actual HTTP response, not simulated.
+Because this phase's one shared-infrastructure change (`conftest.py`'s autouse fixture)
+affects every integration test file, the **full suite was run once**: `pytest -v` →
+**89 passed, 1 skipped** (the golden eval, still correctly self-skipping — no real
+provider keys in this sandbox, unchanged from Phase 3).
+
+No bugs were found in previously-untested Phase 1–3 code paths this phase — Phase 3's
+verification pass already exercised the shared infrastructure this phase builds on
+(migrations, repositories, retriever, orchestrator), so there wasn't a large surface of
+never-executed code left for this phase to newly surface problems in.
+
+### Streaming decision (recap of what was agreed before implementation)
+
+Phase 3's citation strategy forces a tool call (`provide_answer`) whose answer text is a
+field inside a JSON object, not free-flowing text — real token-by-token streaming of just
+that field would mean incrementally parsing partial JSON mid-stream, real added complexity
+for a citation architecture Phase 3 already spent a design decision getting right. Per
+direction from the user: `POST /conversations/{id}/messages` streams SSE **progress
+events** (`retrieving` → `generating` → `done`), not token-by-token text, and Phase 3's
+tool-forced citation architecture is preserved exactly as built — `answer_question()` is
+called the same way `/query` calls it, just with `conversation_history` added.
+Token-level streaming is not implemented this phase.
+
+### Postponed (within Phase 4's own scope)
+
+- **Token-by-token answer streaming.** See "Streaming decision" above — explicit scope
+  decision, not an oversight. Revisit only if the citation architecture itself changes
+  (e.g. inline citation markers in free-flowing text) or if the SSE progress-event UX
+  proves insufficient for a real frontend.
+- **Conversation title/status.** Nothing in this phase's scope reads either; adding them
+  now would be scaffolding ahead of need. Revisit if Phase 5+ needs to list/label
+  conversations for a reviewer queue.
+
+### Architectural decisions made during Phase 4
+
+- **`conversation_history` is additive-only on `answer_question()`/`build_prompt()`**,
+  confirmed with the user before implementation specifically because it touches
+  Phase-3-complete files. Retrieval semantics are untouched — the embedding call still
+  only ever sees the current `question` string; history is prompt-context only. This was
+  verified, not just designed: the full Phase 3 test suite was re-run immediately after
+  the change and a new "identical prompt when omitted" regression test was added.
+- **Citation persistence denormalizes rather than relies on live joins.** Same reasoning
+  extended from Phase 2's `document.error_message`: a citation's `section_title`/
+  `page_number`/`snippet` are copied at write time, and `chunk_id`/`document_id` use
+  `ON DELETE SET NULL` rather than `CASCADE`, so a conversation's citation history stays
+  readable independent of the source chunk's own lifecycle (which is expected to churn —
+  reindexing deletes and replaces chunks).
+- **`CitationRead` for persisted citations is a distinct type from Phase 3's `CitationRead`
+  in `app/schemas/query.py`**, not a shared/reused one, specifically because their
+  nullability differs for a real reason (see "Implemented" above) — reuse would have been
+  DRY for its own sake at the cost of an inaccurate type.
+- **Per-step commits within `generate_answer_stream()`, not one transaction for the whole
+  turn** — consistent with `run_ingestion`'s existing precedent (see PROJECT_PROGRESS.md's
+  "Known limitations" from Phase 2), but the practical reason is stronger here: an SSE
+  client can disconnect mid-stream, and the user's own question should still be saved even
+  if the LLM call after it fails or the connection drops.
+- **`conftest.py`'s autouse cleanup fixture renamed** (`_clean_document_tables` →
+  `_clean_tables`) in the same edit that widened its scope to conversation tables — not a
+  separate unscoped rename, done because leaving a name that no longer describes what the
+  fixture does would be its own small inaccuracy left for the next phase to trip over.
+
+---
+
 ## Deliberately deferred, platform-wide (from EDD §20)
 
 Carried here for visibility — these are cross-cutting design decisions, not phase-specific
@@ -218,12 +555,39 @@ postponements, and stay accurate regardless of which phase is in progress.
 
 ## Remaining work (by phase, per the roadmap in EDD §22)
 
-- **Phase 3:** retriever, RAG orchestrator, prompt builder, LLM client, citation
-  extraction, confidence scoring, no-answer fallback, stateless debug query endpoint,
-  first golden-dataset evaluation.
-- **Phase 4:** conversation/message/citation persistence, conversation memory, streamed
-  `/conversations/{id}/messages`.
-- **Phase 5:** feedback and escalation services, auto-escalation on low confidence.
+- **Phase 5:** feedback and escalation services, auto-escalation on low confidence (using
+  `COPILOT_CONFIDENCE_THRESHOLD` against the score `app/rag/confidence_scorer.py` already
+  produces — every persisted assistant `message` row already carries `confidence`, so
+  Phase 5's escalation trigger can read it directly without new plumbing).
 - **Phase 6:** `/agent` endpoint, vendored `platform_contracts.py`, synchronous
   (non-blocking) risk-context enrichment call to `predictive-maintenance`, performance
   pass, README + `retrieval_card.md` finalized.
+
+### Before starting Phase 5
+
+The golden-dataset harness (`tests/rag_eval/test_golden_eval.py`) still needs to be run
+locally with real `COPILOT_OPENAI_API_KEY` + `COPILOT_ANTHROPIC_API_KEY` at least once —
+it has self-skipped in this sandbox every phase so far for lack of those keys, so Phase
+3's actual citation-recall exit criterion (≥ 0.8 across the six golden questions) has
+still not been checked against real model output. Run:
+
+```bash
+COPILOT_EMBEDDING_PROVIDER=openai COPILOT_OPENAI_API_KEY=... \
+COPILOT_LLM_PROVIDER=anthropic COPILOT_ANTHROPIC_API_KEY=... \
+pytest tests/rag_eval -v -m rag_eval
+```
+
+If recall comes in below 0.8, the likely places to look first are `app/rag/
+prompt_builder.py`'s system prompt wording and whether the seed documents' chunk
+boundaries still land where `scripts/generate_seed_docs.py`'s docstring expects (re-run
+the chunking dry run shown in that script's docstring before assuming the prompt is at
+fault).
+
+Also worth a real (non-fake-provider) manual smoke test before Phase 5: open two browser
+tabs or two `curl --no-buffer` sessions against `POST /conversations/{id}/messages` for
+the *same* conversation back-to-back, and confirm the second answer's prompt actually
+used the first turn as context (e.g. ask "how often should P-101's bearing be lubricated"
+then "what about the seal instead" and confirm the second answer correctly resolves "the
+seal" to P-101 without it being restated). This was verified against the fake LLM client
+(which can't demonstrate real contextual understanding, only that history reaches the
+prompt), not yet against a real model.

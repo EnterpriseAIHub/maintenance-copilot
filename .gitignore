@@ -1,9 +1,12 @@
 __pycache__/
 *.pyc
+
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
 .coverage
+.coverage.*
 htmlcov/
 
 .venv/
@@ -13,4 +16,13 @@ venv/
 
 data/raw/
 
+.idea/
+.vscode/
+
+*.egg-info/
+build/
+dist/
+
 .DS_Store
+
+PROJECT_PROGRESS.md

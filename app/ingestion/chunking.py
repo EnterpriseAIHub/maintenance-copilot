@@ -105,6 +105,13 @@ def chunk_pages(
     buffer_parts: list[str] = []
     buffer_page: int | None = None
     current_section: str | None = None
+    # The section heading in effect when buffer_parts started accumulating
+    # its *current* content — deliberately distinct from current_section,
+    # which keeps advancing as later headings are seen. Using
+    # current_section directly at flush time would mislabel a chunk with
+    # a heading that arrived after most (or all) of that chunk's actual
+    # content, whenever two short sections get packed into one chunk.
+    buffer_section: str | None = None
 
     def flush() -> None:
         if not buffer_parts:
@@ -117,7 +124,7 @@ def chunk_pages(
                 text=text,
                 chunk_index=len(chunks),
                 page_number=buffer_page,
-                section_title=current_section,
+                section_title=buffer_section,
                 token_count=estimate_token_count(text),
             )
         )
@@ -129,6 +136,9 @@ def chunk_pages(
             # citation should point at.
             current_section = paragraph
             continue
+
+        if not buffer_parts:
+            buffer_section = current_section
 
         candidate_parts = [*buffer_parts, paragraph]
         candidate_text = "\n\n".join(candidate_parts)
@@ -147,18 +157,27 @@ def chunk_pages(
             tail = "\n\n".join(buffer_parts)[-overlap_chars:]
             buffer_parts = [tail] if tail else []
             buffer_page = page_number
+            # The overlap tail is trailing content from the section that
+            # just flushed, but any *new* content added from here belongs
+            # to whatever section is current now.
+            buffer_section = current_section if buffer_parts else None
 
         if estimate_token_count(paragraph) > target_tokens:
             # A single paragraph too large to fit even in an empty chunk —
             # sub-split it by sentence rather than emitting one oversized
             # chunk.
+            if not buffer_parts:
+                buffer_section = current_section
             for piece in _split_oversized_paragraph(paragraph, target_tokens):
                 buffer_parts.append(piece)
                 if estimate_token_count("\n\n".join(buffer_parts)) > target_tokens:
                     flush()
                     buffer_parts = []
                     buffer_page = page_number
+                    buffer_section = None
         else:
+            if not buffer_parts:
+                buffer_section = current_section
             buffer_parts.append(paragraph)
 
     flush()

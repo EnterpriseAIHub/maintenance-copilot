@@ -19,9 +19,10 @@ from app.config.settings import settings
 from app.data.models.document import Document
 from app.data.repositories.document_repository import DocumentRepository
 from app.data.session import SessionLocal
+from app.ingestion.extractors import SUPPORTED_EXTENSIONS
 from app.ingestion.pipeline import run_ingestion
 from app.rag.embedding_client import get_embedding_client
-from app.services.errors import NotFoundError
+from app.services.errors import NotFoundError, UnsupportedFileTypeError
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,22 @@ class DocumentService:
         file_bytes: bytes,
         filename: str,
     ) -> Document:
+        # Checked synchronously, before any DB row or file is written —
+        # an unsupported file type is a bad request the caller can fix
+        # immediately, not something that should wait for a background
+        # job to fail asynchronously. Bug found via the integration tests
+        # deferred from Phase 2 (see PROJECT_PROGRESS.md's Phase 3
+        # decision log): previously this was only ever detected inside
+        # run_ingestion_job, so upload always returned 201 even for a
+        # file type ingestion could never process.
+        suffix = Path(filename).suffix.lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
+            raise UnsupportedFileTypeError(
+                f"Unsupported file type: '{suffix}'. "
+                f"Supported types: {sorted(SUPPORTED_EXTENSIONS)}",
+                detail={"filename": filename, "extension": suffix},
+            )
+
         document_id = uuid4()
         file_path = self._store_file(document_id, filename, file_bytes)
 

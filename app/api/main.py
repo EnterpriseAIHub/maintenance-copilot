@@ -1,8 +1,9 @@
 """FastAPI application entrypoint.
 
 Route modules are added here one at a time as each phase implements them
-(conversations in Phase 4, feedback/escalations in Phase 5, agent in
-Phase 6) — health and documents are the routers implemented so far.
+(feedback/escalations in Phase 5, agent in Phase 6) — health, documents,
+the stateless query endpoint, and conversations are the routers
+implemented so far.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api.routes import documents, health
+from app.api.routes import conversations, documents, health, query
 from app.config.logging_config import configure_logging
 from app.config.settings import settings
 from app.services.errors import AppError
@@ -25,6 +26,8 @@ app = FastAPI(
 
 app.include_router(health.router)
 app.include_router(documents.router)
+app.include_router(query.router)
+app.include_router(conversations.router)
 
 
 @app.exception_handler(AppError)

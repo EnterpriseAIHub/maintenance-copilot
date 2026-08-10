@@ -9,6 +9,7 @@ pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
     "integration: tests that require a running Postgres instance",
+    "rag_eval: golden-dataset RAG evaluation harness; requires real OpenAI + Anthropic API keys, self-skips otherwise",
 ]
 
 [tool.ruff]
