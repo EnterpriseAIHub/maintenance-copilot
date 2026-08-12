@@ -26,9 +26,13 @@ jobs:
 
     env:
       COPILOT_DATABASE_URL: postgresql+psycopg://copilot:copilot@localhost:5432/copilot
-      # Fake provider: ingestion tests exercise the real pipeline without
-      # requiring a real OpenAI API key or network access in CI.
+      # Fake providers: ingestion/RAG tests exercise the real pipeline
+      # without requiring real Groq/Gemini/OpenAI API keys or network
+      # access in CI. tests/rag_eval's golden-dataset harness self-skips
+      # when real provider keys aren't configured — see its module
+      # docstring.
       COPILOT_EMBEDDING_PROVIDER: fake
+      COPILOT_LLM_PROVIDER: fake
 
     steps:
       - uses: actions/checkout@v4

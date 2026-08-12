@@ -11,11 +11,36 @@ app/api/routes/conversations.py needs to emit SSE progress events
 synchronous generator — no new async pattern introduced, see
 conversations.py's module docstring for why that's fine under Starlette's
 StreamingResponse.
+
+Phase 5 adds one small, targeted addition here: after an assistant
+message is persisted, if its confidence falls below the escalation
+threshold (app/services/escalation_policy.py::should_escalate_for_confidence,
+a pure function — see that module's docstring for why the threshold
+decision lives there and not inline here), EscalationService.
+escalate_if_needed() is called — the auto-trigger side of Phase 5's
+escalation feature (the manual side is a negative-feedback trigger in
+app/services/feedback_service.py; both funnel through the same function,
+see escalation_service.py's module docstring for why).
+
+Phase 6 adds the one cross-repo call this repo makes: when a conversation
+is scoped to an `equipment_id`, an optional, non-blocking risk-context
+enrichment from `predictive-maintenance` (EDD FR6, §10 — the
+`context_from_predictive_maintenance` field on this endpoint's response,
+"present only if fetched successfully"). This is deliberately NOT
+persisted on the Message row and NOT returned by
+`GET /conversations/{id}/messages` (history) — only attached to the
+"done" event of the turn that triggered it. A risk score is a live,
+time-sensitive fact about equipment state; re-showing a stale snapshot
+days later on every history read would misrepresent it as still current.
+If the EDD is ever clarified to want this persisted/shown in history too,
+revisit this — nothing about the current design blocks that later, it's
+just not what was asked for.
 """
 
 from __future__ import annotations
 
 from collections.abc import Generator
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session
@@ -26,11 +51,15 @@ from app.data.models.conversation import Conversation
 from app.data.models.message import Message
 from app.data.repositories.citation_repository import CitationRepository
 from app.data.repositories.conversation_repository import ConversationRepository
+from app.data.repositories.escalation_repository import EscalationRepository
 from app.data.repositories.message_repository import MessageRepository
 from app.rag.orchestrator import RagAnswer, answer_question
+from app.rag.predictive_maintenance_client import fetch_risk_context
 from app.rag.prompt_builder import ConversationTurn
 from app.schemas.conversation import CitationRead, MessageRead
 from app.services.errors import NotFoundError
+from app.services.escalation_policy import should_escalate_for_confidence
+from app.services.escalation_service import EscalationService
 
 
 class ConversationService:
@@ -39,6 +68,8 @@ class ConversationService:
         self.conversations = ConversationRepository(db)
         self.messages = MessageRepository(db)
         self.citations = CitationRepository(db)
+        self.escalations_repo = EscalationRepository(db)
+        self.escalation_service = EscalationService(db)
 
     def create_conversation(
         self, *, equipment_id: str | None, plant_id: str | None, started_by: str
@@ -123,8 +154,20 @@ class ConversationService:
         assistant_message = self._persist_assistant_turn(conversation.id, result)
         self.db.commit()
 
-        message_read = self._to_message_read(assistant_message, citations=result.citations)
-        yield {"event": "done", "data": message_read.model_dump(mode="json")}
+        escalated = False
+        if should_escalate_for_confidence(result.confidence):
+            self.escalation_service.escalate_if_needed(assistant_message, reason="low_confidence")
+            self.db.commit()
+            escalated = True
+
+        message_read = self._to_message_read(
+            assistant_message, citations=result.citations, escalated=escalated
+        )
+        done_data = message_read.model_dump(mode="json")
+        done_data["context_from_predictive_maintenance"] = self._fetch_risk_context_if_scoped(
+            conversation
+        )
+        yield {"event": "done", "data": done_data}
 
     def _persist_assistant_turn(self, conversation_id: UUID, result: RagAnswer) -> Message:
         assistant_message = Message(
@@ -154,6 +197,19 @@ class ConversationService:
             self.citations.create_many(citation_rows)
 
         return assistant_message
+
+    def _fetch_risk_context_if_scoped(self, conversation: Conversation) -> dict[str, Any] | None:
+        """EDD FR6/§10: optional, non-blocking risk-context enrichment,
+        attempted only when the conversation is scoped to an
+        `equipment_id`. `fetch_risk_context()` itself degrades to `None`
+        on every failure mode (not configured, unreachable, timeout,
+        malformed response) — see its own docstring — so this never
+        raises and never delays the turn beyond
+        COPILOT_PREDICTIVE_MAINTENANCE_TIMEOUT_SECONDS.
+        """
+        if conversation.equipment_id is None:
+            return None
+        return fetch_risk_context(conversation.equipment_id)
 
     def _load_conversation_history(self, conversation_id: UUID) -> list[ConversationTurn]:
         """Pairs up the most recent user/assistant messages (bounded by
@@ -188,7 +244,12 @@ class ConversationService:
 
         return turns[-limit:]
 
-    def _to_message_read(self, message: Message, citations: list | None = None) -> MessageRead:
+    def _to_message_read(
+        self,
+        message: Message,
+        citations: list | None = None,
+        escalated: bool | None = None,
+    ) -> MessageRead:
         if citations is None:
             citation_rows = self.citations.list_by_message(message.id)
             citation_reads = [CitationRead.model_validate(c) for c in citation_rows]
@@ -204,6 +265,9 @@ class ConversationService:
                 for c in citations
             ]
 
+        if escalated is None:
+            escalated = self.escalations_repo.get_open_for_message(message.id) is not None
+
         return MessageRead(
             id=message.id,
             conversation_id=message.conversation_id,
@@ -212,5 +276,6 @@ class ConversationService:
             confidence=message.confidence,
             retrieved_chunk_count=message.retrieved_chunk_count,
             citations=citation_reads,
+            escalated=escalated,
             created_at=message.created_at,
         )

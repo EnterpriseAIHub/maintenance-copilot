@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from fpdf import FPDF
@@ -109,6 +110,10 @@ def test_post_message_streams_progress_events_and_final_answer() -> None:
     assert final["role"] == "assistant"
     assert len(final["citations"]) >= 1
     assert final["confidence"] > 0.0
+    # Key is always present on the "done" event (EDD §10: "present only if
+    # fetched successfully" describes the *value*, not the key) — None by
+    # default here since no predictive-maintenance base URL is configured.
+    assert final["context_from_predictive_maintenance"] is None
 
 
 def test_post_message_404_for_unknown_conversation() -> None:
@@ -151,9 +156,123 @@ def test_get_messages_returns_full_history_after_a_turn() -> None:
     assert [m["role"] for m in messages] == ["user", "assistant"]
     assert messages[0]["content"] == "What is the vibration alarm threshold?"
     assert len(messages[1]["citations"]) >= 1
+    # Deliberately not part of the persisted/history shape — see
+    # app/services/conversation_service.py's module docstring on why a
+    # time-sensitive risk snapshot isn't re-shown on every history read.
+    assert "context_from_predictive_maintenance" not in messages[1]
 
 
 def test_get_messages_404_for_unknown_conversation() -> None:
     response = client.get("/conversations/00000000-0000-0000-0000-000000000000/messages")
 
     assert response.status_code == 404
+
+
+# --- Predictive-maintenance risk-context enrichment (EDD FR6, §10) ---
+
+
+def test_message_omits_predictive_maintenance_context_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.rag.predictive_maintenance_client.settings.predictive_maintenance_base_url", None
+    )
+    _upload("Some content.", equipment_id="EQ-CONV-PM-1")
+    conversation = _create_conversation(equipment_id="EQ-CONV-PM-1")
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages", json={"question": "Some content."}
+    )
+
+    events = _parse_sse_events(response.text)
+    assert events[-1]["data"]["context_from_predictive_maintenance"] is None
+
+
+def test_message_includes_predictive_maintenance_context_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {
+                "failure_probability": 0.82,
+                "model_version": "v1.3.0",
+                "source": "predictive-maintenance:/equipment/EQ-CONV-PM-2/risk",
+            }
+
+    monkeypatch.setattr(
+        "app.rag.predictive_maintenance_client.settings.predictive_maintenance_base_url",
+        "http://predictive-maintenance.local",
+    )
+    monkeypatch.setattr(
+        "app.rag.predictive_maintenance_client.httpx.get",
+        lambda url, timeout: _FakeResponse(),
+    )
+    _upload("Some content.", equipment_id="EQ-CONV-PM-2")
+    conversation = _create_conversation(equipment_id="EQ-CONV-PM-2")
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages", json={"question": "Some content."}
+    )
+
+    events = _parse_sse_events(response.text)
+    assert events[-1]["data"]["context_from_predictive_maintenance"] == {
+        "failure_probability": 0.82,
+        "model_version": "v1.3.0",
+        "source": "predictive-maintenance:/equipment/EQ-CONV-PM-2/risk",
+    }
+
+
+def test_message_degrades_gracefully_when_predictive_maintenance_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.rag.predictive_maintenance_client.settings.predictive_maintenance_base_url",
+        "http://predictive-maintenance.local",
+    )
+
+    def _raise(url: str, timeout: float) -> None:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr("app.rag.predictive_maintenance_client.httpx.get", _raise)
+    _upload("Some content.", equipment_id="EQ-CONV-PM-3")
+    conversation = _create_conversation(equipment_id="EQ-CONV-PM-3")
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages", json={"question": "Some content."}
+    )
+
+    # The whole point: an unreachable sibling must never break the
+    # conversation turn, just omit the enrichment field.
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    assert events[-1]["event"] == "done"
+    assert events[-1]["data"]["context_from_predictive_maintenance"] is None
+    assert events[-1]["data"]["content"]
+
+
+def test_message_without_conversation_equipment_id_never_attempts_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.rag.predictive_maintenance_client.settings.predictive_maintenance_base_url",
+        "http://predictive-maintenance.local",
+    )
+
+    def _fail_if_called(url: str, timeout: float) -> None:
+        raise AssertionError(
+            "enrichment should not be attempted without a conversation equipment_id"
+        )
+
+    monkeypatch.setattr("app.rag.predictive_maintenance_client.httpx.get", _fail_if_called)
+    conversation = _create_conversation()  # no equipment_id
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages", json={"question": "Anything at all?"}
+    )
+
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    assert events[-1]["data"]["context_from_predictive_maintenance"] is None

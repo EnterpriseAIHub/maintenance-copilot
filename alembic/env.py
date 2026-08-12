@@ -10,7 +10,15 @@ from app.data.base import Base
 
 # Import model modules here so their tables are registered on
 # Base.metadata and autogenerate can see them.
-from app.data.models import chunk, citation, conversation, document, message  # noqa: F401
+from app.data.models import (  # noqa: F401
+    chunk,
+    citation,
+    conversation,
+    document,
+    escalation,
+    feedback,
+    message,
+)
 
 config = context.config
 

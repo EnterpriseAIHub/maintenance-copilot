@@ -8,16 +8,21 @@ citation points at the section a correct answer should be grounded in.
 
 Requires:
   - A live, migrated Postgres instance (same as tests/integration/).
-  - COPILOT_EMBEDDING_PROVIDER=openai with COPILOT_OPENAI_API_KEY set.
-  - COPILOT_LLM_PROVIDER=anthropic with COPILOT_ANTHROPIC_API_KEY set.
+  - COPILOT_EMBEDDING_PROVIDER set to a real (non-"fake") provider, with
+    that provider's API key configured (e.g. COPILOT_EMBEDDING_PROVIDER=
+    gemini + COPILOT_GEMINI_API_KEY, the current demo default).
+  - COPILOT_LLM_PROVIDER set to a real (non-"fake") provider, with that
+    provider's API key configured (e.g. COPILOT_LLM_PROVIDER=groq +
+    COPILOT_GROQ_API_KEY, the current demo default).
 
 The "fake" providers are deterministic but not semantically meaningful
 (see their docstrings) — running this harness against them wouldn't test
 anything about real retrieval quality or citation accuracy, so it's
-skipped automatically rather than run against fakes. Run it explicitly:
+skipped automatically rather than run against fakes. Run it explicitly,
+e.g. with the current demo-default providers:
 
-    COPILOT_EMBEDDING_PROVIDER=openai COPILOT_OPENAI_API_KEY=... \
-    COPILOT_LLM_PROVIDER=anthropic COPILOT_ANTHROPIC_API_KEY=... \
+    COPILOT_EMBEDDING_PROVIDER=gemini COPILOT_GEMINI_API_KEY=... \
+    COPILOT_LLM_PROVIDER=groq COPILOT_GROQ_API_KEY=... \
     pytest tests/rag_eval -v -m rag_eval
 
 RECALL_THRESHOLD is deliberately below 1.0 (allowing up to one miss out
@@ -46,20 +51,31 @@ from tests.rag_eval.golden_dataset import GOLDEN_DATASET
 
 SEED_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "seed"
 
-_REAL_PROVIDERS_CONFIGURED = bool(
-    settings.embedding_provider == "openai"
-    and settings.openai_api_key
-    and settings.llm_provider == "anthropic"
-    and settings.anthropic_api_key
-)
+# Generic across every supported provider (fake/groq/gemini/openai for
+# LLM; fake/gemini/openai for embeddings) rather than hardcoded to one
+# specific real pair — a real, non-"fake" provider with its matching key
+# set is enough to make this harness meaningful, whichever one it is.
+_EMBEDDING_KEYS = {"gemini": "gemini_api_key", "openai": "openai_api_key"}
+_LLM_KEYS = {"groq": "groq_api_key", "gemini": "gemini_api_key", "openai": "openai_api_key"}
+
+
+def _real_provider_configured(provider: str, key_map: dict[str, str]) -> bool:
+    key_attr = key_map.get(provider)
+    return key_attr is not None and bool(getattr(settings, key_attr))
+
+
+_REAL_PROVIDERS_CONFIGURED = _real_provider_configured(
+    settings.embedding_provider, _EMBEDDING_KEYS
+) and _real_provider_configured(settings.llm_provider, _LLM_KEYS)
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.rag_eval,
     pytest.mark.skipif(
         not _REAL_PROVIDERS_CONFIGURED,
-        reason="Requires real OPENAI_API_KEY + ANTHROPIC_API_KEY — the fake providers "
-        "aren't semantically meaningful, see module docstring.",
+        reason="Requires a real (non-fake) embedding provider and LLM provider, each with "
+        "its matching API key configured — the fake providers aren't semantically "
+        "meaningful, see module docstring.",
     ),
 ]
 

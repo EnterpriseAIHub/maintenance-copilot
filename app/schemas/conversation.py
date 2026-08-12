@@ -9,6 +9,9 @@ in-flight orchestrator.Citation these come from always has both set.
 Reusing the non-nullable Phase 3 type here would either be wrong (lie
 about nullability) or force loosening a type Phase 3 already got right
 for its own use case.
+
+`MessageRead.escalated` (Phase 5) reflects whether an *open* Escalation
+currently exists for that message — see app/services/escalation_service.py.
 """
 
 from __future__ import annotations
@@ -59,6 +62,7 @@ class MessageRead(BaseModel):
     confidence: float | None
     retrieved_chunk_count: int | None
     citations: list[CitationRead]
+    escalated: bool
     created_at: datetime
 
 

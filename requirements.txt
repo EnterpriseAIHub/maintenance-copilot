@@ -1,7 +1,7 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-pydantic==2.10.5
-pydantic-settings==2.7.1
+pydantic==2.12.5
+pydantic-settings==2.12.0
 SQLAlchemy==2.0.37
 alembic==1.14.1
 psycopg[binary]==3.2.4
@@ -12,8 +12,8 @@ python-multipart==0.0.20
 pypdf==5.1.0
 python-docx==1.1.2
 
-# Embedding provider (Phase 2) — default target per EDD §15. See
-# app/rag/embedding_client.py for the swappable interface; a "fake"
-# provider is also available for tests/local dev without an API key.
 openai==1.59.7
-anthropic==0.42.0
+google-genai==2.17.0
+groq==1.6.0
+
+httpx==0.28.1
